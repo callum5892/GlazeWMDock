@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using GlazeWMDock.Configuration;
 using GlazeWMDock.Workspaces;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
@@ -9,55 +10,52 @@ namespace GlazeWMDock;
 
 /// <summary>
 /// The extension's command provider. It:
-///   - exposes a top-level "GlazeWM Workspaces" palette page, and
-///   - provides one Dock band that shows the workspace strip as live text.
+///   - exposes a top-level "GlazeWM Workspaces" palette page,
+///   - provides four Dock bands — the original workspace strip (live text),
+///     clickable workspace buttons, the focused window, and mode/tiling
+///     direction — each pinnable on its own from Dock settings, and
+///   - exposes a settings page (port, workspaces, labels, ...).
 ///
-/// A single <see cref="GlazeWmClient"/> feeds live state to both. The Dock
-/// band's text item is created once and mutated in place as state changes.
+/// A single <see cref="GlazeWmClient"/> feeds live state to all of them. The
+/// latest snapshot of each kind is cached so a rebuilt band, or a settings
+/// change, can re-render immediately without waiting for the next WM event.
 /// </summary>
 public partial class GlazeWMDockCommandsProvider : CommandProvider
 {
-    // The workspaces shown on the Dock. These mirror the `workspaces:` block in
-    // your glazewm config.yaml (names "1".."10"). All of them are shown at all
-    // times; inactive ones render as a plain (un-circled) digit. To instead
-    // show only *active* workspaces, flip ShowOnlyActive in WorkspaceStripItem.
-    private static readonly string[] WorkspaceNames =
-        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
-
     private const string ProviderId = "com.brettkinny.glazewmdock";
     private const string DockBandId = "com.brettkinny.glazewmdock.workspaces";
 
-    private readonly GlazeWmClient _client = new();
+    private readonly DockSettings _settings = new();
+    private readonly GlazeWmClient _client;
     private readonly WorkspacesListPage _page;
     private readonly ICommandItem[] _topLevel;
 
-    // The strip/band are rebuilt if the Dock's live-update channel breaks (see
-    // OnMonitorsChanged), so they aren't readonly. _dockBand is read on a host
-    // COM thread (GetDockBands) and reassigned on the WebSocket receive thread,
-    // hence volatile. _latest caches the newest snapshot so a rebuilt strip can
-    // be seeded with current state instead of the constructor placeholder.
-    private volatile WorkspaceStripItem _strip;
-    private volatile WrappedDockItem _dockBand;
-    private IReadOnlyList<MonitorInfo> _latest = [];
+    // Serialises renders: WM events arrive on the WebSocket receive thread,
+    // settings saves on a host COM thread.
+    private readonly object _renderLock = new();
+
+    // The bands are rebuilt if the Dock's live-update channel breaks (see
+    // Render), so they aren't readonly. _bands is read on a host COM thread
+    // (GetDockBands) and reassigned on the WebSocket receive thread, hence
+    // volatile.
+    private volatile Bands _bands;
+
+    private IReadOnlyList<MonitorInfo> _monitors = [];
+    private volatile FocusedInfo? _focused;
+    private WmState _state = WmState.Empty;
+    private int _port;
 
     public GlazeWMDockCommandsProvider()
     {
         Id = ProviderId;
         DisplayName = "GlazeWM Workspaces";
         Icon = new IconInfo(char.ConvertFromUtf32(0xE7F4)); // Segoe Fluent "Tiles"
+        Settings = _settings.Settings;
 
+        _port = _settings.Port;
+        _client = new GlazeWmClient(() => _settings.Port);
         _page = new WorkspacesListPage(_client);
-
-        // One band, one child item whose Title/Subtitle *is* the live text on
-        // the bar (clicking it opens the switcher page). This is the built-in
-        // widget pattern — the Dock renders the child item's Title inline.
-        _strip = new WorkspaceStripItem(_page, WorkspaceNames);
-
-        // The 3rd arg is the band's label in the Dock picker / Settings → Bands
-        // (NOT the on-bar text — that's the strip item's live Title). Keep it
-        // distinct from the top-level palette command below so the two are easy
-        // to tell apart when pinning.
-        _dockBand = new WrappedDockItem([_strip], DockBandId, "GlazeWM Workspace Strip");
+        _bands = CreateBands();
 
         _topLevel =
         [
@@ -68,18 +66,21 @@ public partial class GlazeWMDockCommandsProvider : CommandProvider
             },
         ];
 
+        _settings.Changed += OnSettingsChanged;
         _client.MonitorsChanged += OnMonitorsChanged;
+        _client.FocusedChanged += OnFocusedChanged;
+        _client.StateChanged += OnStateChanged;
         _client.Start();
         Log.Line("provider constructed; GlazeWM client started");
     }
 
     public override ICommandItem[] TopLevelCommands() => _topLevel;
 
-    public override ICommandItem[]? GetDockBands() => [_dockBand];
+    public override ICommandItem[]? GetDockBands() => _bands.All;
 
     private void OnMonitorsChanged(IReadOnlyList<MonitorInfo> monitors)
     {
-        _latest = monitors;
+        _monitors = monitors;
 
         // The switcher page lists every workspace across all monitors, so flatten
         // the per-monitor tree back into a single list for it.
@@ -88,8 +89,7 @@ public partial class GlazeWMDockCommandsProvider : CommandProvider
         // Update the palette page FIRST and guard it independently. The page
         // re-pulls GetItems() every time it's opened, so it self-heals even
         // when no live notification reaches the host — but only if this call
-        // actually runs. Previously it sat *after* _strip.Update(), so a throw
-        // from the strip skipped it and froze the switcher too.
+        // actually runs.
         try
         {
             _page.SetSnapshot(workspaces);
@@ -100,43 +100,101 @@ public partial class GlazeWMDockCommandsProvider : CommandProvider
             Log.Line($"page update failed: {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
         }
 
-        // Updating the strip assigns Title/Subtitle, which raises PropChanged
-        // and marshals to CmdPal.UI over COM. That UI process restarts on a
-        // monitor hot-plug while this singleton extension keeps running, which
-        // leaves a dead subscriber on the strip; raising into it throws. An
-        // unguarded throw here used to unwind into GlazeWmClient's swallowing
-        // catch and permanently freeze every future update until a manual
-        // reload. Now we catch it and rebuild the band so the host can re-bind.
-        try
+        Render(b =>
         {
-            _strip.Update(monitors);
-        }
-        catch (Exception ex)
+            b.Strip.Update(monitors, _settings);
+            b.Buttons.Update(monitors, _settings);
+        });
+    }
+
+    private void OnFocusedChanged(FocusedInfo focused)
+    {
+        // Command Palette's own window isn't a GlazeWM window worth showing
+        // (or targeting with window actions); keep the last real one.
+        if (focused.IsWindow && focused.ProcessName.StartsWith("Microsoft.CmdPal", StringComparison.OrdinalIgnoreCase))
         {
-            Log.Line($"strip update failed (host proxy likely dead): {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message} — rebuilding dock band");
-            RebuildDockBand();
+            return;
         }
+
+        _focused = focused;
+        Render(b => b.Focused.Update(focused, _settings));
+    }
+
+    private void OnStateChanged(WmState state)
+    {
+        _state = state;
+        Render(b => b.Mode.Update(state));
+    }
+
+    private void OnSettingsChanged()
+    {
+        var port = _settings.Port;
+        if (port != _port)
+        {
+            _port = port;
+            Log.Line($"port changed to {port}; reconnecting");
+            _client.Reconnect();
+        }
+
+        Render(RenderAll);
     }
 
     /// <summary>
-    /// Replaces the dock band with a fresh strip (which has no dead COM
-    /// subscribers) seeded with the latest snapshot, then asks the host to
-    /// re-pull <see cref="GetDockBands"/> so it re-subscribes to the new item.
-    /// This is how the Dock recovers its live text after CmdPal.UI restarts
+    /// Applies an update to the live bands. Updating assigns Title/Subtitle,
+    /// which raises PropChanged and marshals to CmdPal.UI over COM. That UI
+    /// process restarts on a monitor hot-plug while this singleton extension
+    /// keeps running, which leaves a dead subscriber on the items; raising into
+    /// it throws. An unguarded throw here used to unwind into GlazeWmClient's
+    /// swallowing catch and permanently freeze every future update until a
+    /// manual reload. Now we catch it and rebuild the bands so the host can
+    /// re-bind.
+    /// </summary>
+    private void Render(Action<Bands> update)
+    {
+        lock (_renderLock)
+        {
+            try
+            {
+                update(_bands);
+            }
+            catch (Exception ex)
+            {
+                Log.Line($"band update failed (host proxy likely dead): {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message} — rebuilding dock bands");
+                RebuildDockBands();
+            }
+        }
+    }
+
+    private void RenderAll(Bands b)
+    {
+        b.Strip.Update(_monitors, _settings);
+        b.Buttons.Update(_monitors, _settings);
+        if (_focused is { } focused)
+        {
+            b.Focused.Update(focused, _settings);
+        }
+
+        b.Mode.Update(_state);
+    }
+
+    /// <summary>
+    /// Replaces every band with fresh items (which have no dead COM
+    /// subscribers) seeded with the latest snapshots, then asks the host to
+    /// re-pull <see cref="GetDockBands"/> so it re-subscribes to the new items.
+    /// This is how the Dock recovers its live state after CmdPal.UI restarts
     /// without a manual reload. If the host is unreachable right now the next
-    /// event (or a reload) retries; a fresh strip has no subscribers so it
+    /// event (or a reload) retries; fresh items have no subscribers so they
     /// won't throw again, so this can't loop.
     /// </summary>
-    private void RebuildDockBand()
+    private void RebuildDockBands()
     {
         try
         {
-            var strip = new WorkspaceStripItem(_page, WorkspaceNames);
-            strip.Update(_latest);
-            _strip = strip;
-            _dockBand = new WrappedDockItem([strip], DockBandId, "GlazeWM Workspace Strip");
+            var bands = CreateBands();
+            RenderAll(bands);
+            _bands = bands;
             RaiseItemsChanged(_topLevel.Length);
-            Log.Line("dock band rebuilt; RaiseItemsChanged sent so host re-binds");
+            Log.Line("dock bands rebuilt; RaiseItemsChanged sent so host re-binds");
         }
         catch (Exception ex)
         {
@@ -145,11 +203,43 @@ public partial class GlazeWMDockCommandsProvider : CommandProvider
         }
     }
 
+    private Bands CreateBands()
+    {
+        var strip = new WorkspaceStripItem(_page, _settings.WorkspaceNames);
+
+        // The 3rd arg is the band's label in the Dock picker / Settings → Bands
+        // (NOT the on-bar text — that's the strip item's live Title). Keep it
+        // distinct from the top-level palette command so the two are easy to
+        // tell apart when pinning.
+        return new Bands(
+            new WrappedDockItem([strip], DockBandId, "GlazeWM Workspace Strip"),
+            strip,
+            new WorkspaceButtonsBand(_client, FocusedWindowId),
+            new FocusedWindowBand(_client, () => _settings, () => _focused),
+            new ModeBand(_client));
+    }
+
+    private string? FocusedWindowId() => _focused is { IsWindow: true } f ? f.Id : null;
+
     public override void Dispose()
     {
+        _settings.Changed -= OnSettingsChanged;
         _client.MonitorsChanged -= OnMonitorsChanged;
+        _client.FocusedChanged -= OnFocusedChanged;
+        _client.StateChanged -= OnStateChanged;
         _client.Dispose();
         base.Dispose();
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>One generation of Dock bands; replaced wholesale on rebuild.</summary>
+    private sealed record Bands(
+        WrappedDockItem StripBand,
+        WorkspaceStripItem Strip,
+        WorkspaceButtonsBand Buttons,
+        FocusedWindowBand Focused,
+        ModeBand Mode)
+    {
+        public ICommandItem[] All { get; } = [StripBand, Buttons, Focused, Mode];
     }
 }

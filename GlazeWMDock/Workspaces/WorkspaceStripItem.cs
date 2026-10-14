@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using GlazeWMDock.Configuration;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
 
@@ -40,19 +41,7 @@ namespace GlazeWMDock.Workspaces;
 /// </summary>
 internal sealed partial class WorkspaceStripItem : ListItem
 {
-    // When true (default), only active workspaces (displayed on a monitor or
-    // holding windows) appear — matching Zebar, so unused numbers are hidden.
-    // The focused workspace always counts as active, so you always see where
-    // you are even if it's empty. Set false for a persistent i3-style strip
-    // that also lists every configured-but-inactive workspace as a plain digit
-    // (appended after the per-monitor groups, since inactive workspaces aren't
-    // reported against any monitor by the IPC).
-    //
-    // static readonly (not const) so flipping it doesn't make the compiler fold
-    // the other branch into an "unreachable code" warning.
-    private static readonly bool ShowOnlyActive = true;
-
-    private readonly string[] _names;
+    private string[] _names;
 
     public WorkspaceStripItem(ICommand switcher, string[] names)
         : base(switcher)
@@ -66,9 +55,17 @@ internal sealed partial class WorkspaceStripItem : ListItem
     /// <summary>
     /// Recompute the on-bar text from the latest monitor snapshot. Assigning
     /// Title/Subtitle raises PropChanged, so the Dock repaints the strip live.
+    ///
+    /// With <see cref="DockSettings.ShowOnlyActive"/> (default) only active
+    /// workspaces (displayed on a monitor or holding windows) appear — matching
+    /// Zebar, so unused numbers are hidden. Turned off, it's a persistent
+    /// i3-style strip that also lists every configured-but-inactive workspace
+    /// as a plain digit (appended after the per-monitor groups, since inactive
+    /// workspaces aren't reported against any monitor by the IPC).
     /// </summary>
-    public void Update(IReadOnlyList<MonitorInfo> monitors)
+    public void Update(IReadOnlyList<MonitorInfo> monitors, DockSettings settings)
     {
+        _names = settings.WorkspaceNames;
         var strip = new StringBuilder();
         var focusedDetail = string.Empty;
         var activeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -135,7 +132,7 @@ internal sealed partial class WorkspaceStripItem : ListItem
 
         // i3-style mode: list configured workspaces that aren't active anywhere.
         // They have no monitor grouping in the IPC, so trail them as plain digits.
-        if (!ShowOnlyActive)
+        if (!settings.ShowOnlyActive)
         {
             foreach (var name in _names)
             {
@@ -153,8 +150,16 @@ internal sealed partial class WorkspaceStripItem : ListItem
             }
         }
 
-        Title = strip.Length > 0 ? strip.ToString() : "no workspaces";
-        Subtitle = focusedDetail;
+        var title = strip.Length > 0 ? strip.ToString() : "no workspaces";
+        if (Title != title)
+        {
+            Title = title;
+        }
+
+        if (Subtitle != focusedDetail)
+        {
+            Subtitle = focusedDetail;
+        }
     }
 
     /// <summary>

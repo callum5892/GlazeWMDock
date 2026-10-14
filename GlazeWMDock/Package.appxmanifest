@@ -9,20 +9,17 @@
   IgnorableNamespaces="uap uap3 rescap">
 
   <Identity
-    Name="BrettKinny.GlazeWMWorkspaces"
-    Publisher="CN=990828D1-845D-4BDA-A62D-6048473196F7"
-    Version="1.0.1.0" />
-  <!-- Store identity (Partner Center product "GlazeWM Workspaces", Store ID
-       9NTLS4PBWN3X). PFN: BrettKinny.GlazeWMWorkspaces_qh71y33f4g84y. The Store
-       re-signs the package, so no self-signed cert is used for Store builds.
-       For local dev sideloading, temporarily revert Name/Publisher to the
-       self-signed "CN=GlazeWMDock Dev" identity (keep that on a branch/stash).
-       Version: the Store reserves the 4th field (must stay 0); bump the 3rd field
-       for each submission (1.0.1.0, 1.0.2.0, ...). -->
+    Name="GlazeWMDock.Dev"
+    Publisher="CN=GlazeWMDock Dev"
+    Version="1.1.1.0" />
+  <!-- Fork: self-signed sideload identity ("CN=GlazeWMDock Dev"). Upstream's
+       Store identity is Name="BrettKinny.GlazeWMWorkspaces"
+       Publisher="CN=990828D1-845D-4BDA-A62D-6048473196F7" (Store ID
+       9NTLS4PBWN3X); restore it, and drop this commit, for an upstream PR. -->
 
   <Properties>
     <DisplayName>GlazeWM Workspaces</DisplayName>
-    <PublisherDisplayName>Brett Kinny</PublisherDisplayName>
+    <PublisherDisplayName>GlazeWMDock Dev</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 
