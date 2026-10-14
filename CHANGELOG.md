@@ -12,6 +12,36 @@ which maps to package versions `1.0.0.0`, `1.0.1.0`, `1.0.2.0`.
 - Preparing the first public / Microsoft Store release: MIT license, public docs,
   community-health files, and package version restructured to `1.0.0.0`.
 
+## [1.1.1] - fork: dock improvements
+
+Package versions `1.1.0.0` / `1.1.1.0`, sideloaded under the fork's self-signed
+`CN=GlazeWMDock Dev` identity rather than the Store identity.
+
+### Added
+- **GlazeWM Workspace Buttons** band: one clickable button per workspace that
+  focuses it directly, with the focused workspace in `[brackets]`. Right-click a
+  button to move the focused window there, or to move it and follow.
+- Custom workspace buttons: per-workspace labels and icons (emoji or Segoe
+  Fluent glyph code) set as `name = label | icon` lines in settings.
+- **GlazeWM Focused Window** band: the focused window's title, process and
+  state icon. Click or right-click it for window actions (toggle floating,
+  tiling or fullscreen, minimize, close, move to a workspace), which target the
+  window by id (`command --id`).
+- **GlazeWM Mode & Tiling Direction** band: shows the tiling direction (click to
+  flip it), the active binding mode (click to exit it), or PAUSED (click to
+  resume). Right-click for toggle pause, redraw and reload config.
+- Settings page in Command Palette: IPC port, workspace list, show only active
+  workspaces, button style, custom buttons, window counts and focused-title
+  length. Saving applies immediately; a port change reconnects.
+
+### Changed
+- The IPC client also subscribes to window, mode, tiling-direction and pause
+  events, and coalesces each burst of events into one round of queries.
+- The workspace strip reads its workspace list and show-only-active option from
+  settings instead of compile-time constants.
+- A failed live update rebuilds every band, not just the strip, so all bands
+  recover after Command Palette's UI process restarts.
+
 ## [1.0.1] - certification fix (pending)
 
 ### Fixed

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -11,11 +12,15 @@ namespace GlazeWMDock.Workspaces;
 /// <summary>
 /// Minimal client for GlazeWM's IPC WebSocket server (ws://localhost:6123).
 ///
-/// On connect it subscribes to the workspace/focus events and pulls the
-/// initial monitor list. Any subscribed event triggers a re-query of the
-/// authoritative "query monitors" tree — which groups workspaces under their
-/// owning monitor and carries each monitor's position and focus — surfaced via
-/// <see cref="MonitorsChanged"/>. The connection auto-reconnects.
+/// On connect it subscribes to the workspace, focus, window and mode events
+/// and pulls the initial state. Events are coalesced: a burst (a workspace
+/// switch fires several) schedules one refresh that re-runs the authoritative
+/// queries, and each response is surfaced through its own event:
+///   - "query monitors"  -> <see cref="MonitorsChanged"/>
+///   - "query focused"   -> <see cref="FocusedChanged"/>
+///   - "query tiling-direction" / "binding-modes" / "paused" -> <see cref="StateChanged"/>
+/// The connection auto-reconnects, and <see cref="Reconnect"/> forces it (used
+/// when the port setting changes).
 ///
 /// (We query monitors rather than "query workspaces" because the strip needs to
 /// render each monitor's workspaces separately; the flat workspace list has no
@@ -26,33 +31,79 @@ namespace GlazeWMDock.Workspaces;
 /// </summary>
 internal sealed partial class GlazeWmClient : IDisposable
 {
-    private const int DefaultPort = 6123;
     private const string QueryMonitors = "query monitors";
-    private const string SubscribeWorkspaceEvents =
-        "sub --events focus_changed workspace_activated workspace_deactivated workspace_updated";
+    private const string QueryFocused = "query focused";
+    private const string QueryTilingDirection = "query tiling-direction";
+    private const string QueryBindingModes = "query binding-modes";
+    private const string QueryPaused = "query paused";
 
-    private readonly Uri _uri;
+    private const string SubscribeEvents =
+        "sub --events focus_changed focused_container_moved workspace_activated workspace_deactivated "
+        + "workspace_updated window_managed window_unmanaged binding_modes_changed tiling_direction_changed "
+        + "pause_changed";
+
+    // Window-manager events arrive in bursts (one workspace switch is a
+    // deactivate + activate + focus change). Wait this long after the first
+    // event before re-querying so the burst costs one round of queries.
+    private static readonly TimeSpan RefreshDelay = TimeSpan.FromMilliseconds(30);
+
+    private readonly Func<int> _port;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
     private ClientWebSocket? _socket;
+    private int _refreshPending;
+
+    // Mode state is assembled from three separate query responses.
+    private string[] _bindingModes = [];
+    private bool _paused;
+    private string _tilingDirection = string.Empty;
 
     /// <summary>Raised whenever a fresh monitor/workspace snapshot arrives.</summary>
     public event Action<IReadOnlyList<MonitorInfo>>? MonitorsChanged;
 
-    public GlazeWmClient(int port = DefaultPort)
+    /// <summary>Raised whenever a fresh focused-container snapshot arrives.</summary>
+    public event Action<FocusedInfo>? FocusedChanged;
+
+    /// <summary>Raised when binding modes, pause state or tiling direction are re-read.</summary>
+    public event Action<WmState>? StateChanged;
+
+    /// <param name="port">Read on every (re)connect, so a port change applies on <see cref="Reconnect"/>.</param>
+    public GlazeWmClient(Func<int> port)
     {
-        _uri = new Uri($"ws://127.0.0.1:{port}");
+        _port = port;
     }
 
     /// <summary>Starts the background connect/receive/reconnect loop.</summary>
     public void Start() => _ = Task.Run(() => RunAsync(_cts.Token));
 
-    /// <summary>Sends a WM command, e.g. "focus --workspace 3".</summary>
-    public async Task RunCommandAsync(string command)
+    /// <summary>Drops the current connection; the loop reconnects, re-reading the port.</summary>
+    public void Reconnect()
     {
         try
         {
-            await SendAsync($"command {command}").ConfigureAwait(false);
+            _socket?.Abort();
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    /// <summary>
+    /// Sends a WM command, e.g. "focus --workspace 3". With
+    /// <paramref name="subjectId"/> the command targets that container
+    /// (<c>command --id &lt;id&gt; ...</c>) rather than whatever is focused when
+    /// it arrives — clicking the Dock or opening the palette can move focus, so
+    /// window actions pin the window they were built for.
+    /// </summary>
+    public async Task RunCommandAsync(string command, string? subjectId = null)
+    {
+        try
+        {
+            var message = string.IsNullOrEmpty(subjectId)
+                ? $"command {command}"
+                : $"command --id {subjectId} {command}";
+            await SendAsync(message).ConfigureAwait(false);
         }
         catch
         {
@@ -68,22 +119,24 @@ internal sealed partial class GlazeWmClient : IDisposable
             {
                 using var socket = new ClientWebSocket();
                 _socket = socket;
-                await socket.ConnectAsync(_uri, token).ConfigureAwait(false);
-                Log.Line($"IPC connected to {_uri}");
+                var uri = new Uri($"ws://127.0.0.1:{_port()}");
+                await socket.ConnectAsync(uri, token).ConfigureAwait(false);
+                Log.Line($"IPC connected to {uri}");
 
-                await SendAsync(SubscribeWorkspaceEvents).ConfigureAwait(false);
-                await SendAsync(QueryMonitors).ConfigureAwait(false);
+                await SendAsync(SubscribeEvents).ConfigureAwait(false);
+                await RefreshAsync().ConfigureAwait(false);
 
                 await ReceiveLoopAsync(socket, token).ConfigureAwait(false);
                 Log.Line("IPC receive loop ended (socket closed); will reconnect");
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
                 break;
             }
             catch (Exception ex)
             {
-                // Connection failed or dropped; fall through to the retry delay.
+                // Connection failed, dropped, or was aborted by Reconnect(); fall
+                // through to the retry delay.
                 Log.Line($"IPC connect/receive failed: {ex.GetType().Name}: {ex.Message}");
             }
             finally
@@ -128,11 +181,43 @@ internal sealed partial class GlazeWmClient : IDisposable
             }
             while (!result.EndOfMessage);
 
-            await HandleMessageAsync(sb.ToString()).ConfigureAwait(false);
+            HandleMessage(sb.ToString());
         }
     }
 
-    private async Task HandleMessageAsync(string json)
+    /// <summary>Re-runs every state query; each response raises its own event.</summary>
+    private async Task RefreshAsync()
+    {
+        await SendAsync(QueryMonitors).ConfigureAwait(false);
+        await SendAsync(QueryFocused).ConfigureAwait(false);
+        await SendAsync(QueryTilingDirection).ConfigureAwait(false);
+        await SendAsync(QueryBindingModes).ConfigureAwait(false);
+        await SendAsync(QueryPaused).ConfigureAwait(false);
+    }
+
+    private void ScheduleRefresh()
+    {
+        if (Interlocked.Exchange(ref _refreshPending, 1) == 1)
+        {
+            return; // a refresh is already queued for this burst
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(RefreshDelay, _cts.Token).ConfigureAwait(false);
+                Interlocked.Exchange(ref _refreshPending, 0);
+                await RefreshAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _refreshPending, 0);
+            }
+        });
+    }
+
+    private void HandleMessage(string json)
     {
         try
         {
@@ -148,34 +233,102 @@ internal sealed partial class GlazeWmClient : IDisposable
 
             if (messageType == "event_subscription")
             {
-                // Something changed; ask for the authoritative monitor tree.
-                await SendAsync(QueryMonitors).ConfigureAwait(false);
+                // Something changed; ask for the authoritative state.
+                ScheduleRefresh();
                 return;
             }
 
-            if (messageType == "client_response"
-                && root.TryGetProperty("clientMessage", out var cm)
-                && cm.GetString() == QueryMonitors
-                && root.TryGetProperty("success", out var ok)
-                && ok.ValueKind == JsonValueKind.True
-                && root.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Object
-                && data.TryGetProperty("monitors", out var monArray)
-                && monArray.ValueKind == JsonValueKind.Array)
+            if (messageType != "client_response"
+                || !root.TryGetProperty("clientMessage", out var cm)
+                || !root.TryGetProperty("success", out var ok)
+                || ok.ValueKind != JsonValueKind.True
+                || !root.TryGetProperty("data", out var data))
             {
-                var list = new List<MonitorInfo>(monArray.GetArrayLength());
-                foreach (var mon in monArray.EnumerateArray())
-                {
-                    list.Add(ParseMonitor(mon));
-                }
+                return;
+            }
 
-                MonitorsChanged?.Invoke(list);
+            switch (cm.GetString())
+            {
+                case QueryMonitors:
+                    HandleMonitors(data);
+                    break;
+                case QueryFocused:
+                    HandleFocused(data);
+                    break;
+                case QueryTilingDirection:
+                    _tilingDirection = data.ValueKind == JsonValueKind.Object ? GetString(data, "tilingDirection") : string.Empty;
+                    break;
+                case QueryBindingModes:
+                    _bindingModes = ParseBindingModes(data);
+                    break;
+                case QueryPaused:
+                    // Last query of a refresh round, so publish the assembled state once.
+                    _paused = data.ValueKind == JsonValueKind.True;
+                    StateChanged?.Invoke(new WmState(_bindingModes, _paused, _tilingDirection));
+                    break;
             }
         }
         catch
         {
             // Ignore malformed or unexpected frames.
         }
+    }
+
+    private void HandleMonitors(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object
+            || !data.TryGetProperty("monitors", out var monArray)
+            || monArray.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var list = new List<MonitorInfo>(monArray.GetArrayLength());
+        foreach (var mon in monArray.EnumerateArray())
+        {
+            list.Add(ParseMonitor(mon));
+        }
+
+        MonitorsChanged?.Invoke(list);
+    }
+
+    private void HandleFocused(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object
+            || !data.TryGetProperty("focused", out var f)
+            || f.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        var isWindow = string.Equals(GetString(f, "type"), "window", StringComparison.OrdinalIgnoreCase);
+        var state = f.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.Object
+            ? GetString(st, "type")
+            : string.Empty;
+
+        FocusedChanged?.Invoke(new FocusedInfo(
+            IsWindow: isWindow,
+            Id: GetString(f, "id"),
+            Title: isWindow ? GetString(f, "title") : FirstNonEmpty(GetString(f, "displayName"), GetString(f, "name")),
+            ProcessName: GetString(f, "processName"),
+            State: state));
+    }
+
+    private static string[] ParseBindingModes(JsonElement data)
+    {
+        if (data.ValueKind != JsonValueKind.Object
+            || !data.TryGetProperty("bindingModes", out var modes)
+            || modes.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        return modes.EnumerateArray()
+            .Select(m => m.ValueKind == JsonValueKind.Object
+                ? GetString(m, "name")
+                : string.Empty)
+            .Where(n => n.Length > 0)
+            .ToArray();
     }
 
     private static MonitorInfo ParseMonitor(JsonElement mon)
@@ -231,6 +384,8 @@ internal sealed partial class GlazeWmClient : IDisposable
 
         return count;
     }
+
+    private static string FirstNonEmpty(string a, string b) => string.IsNullOrEmpty(a) ? b : a;
 
     private static string GetString(JsonElement el, string prop) =>
         el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String
